@@ -64,6 +64,20 @@ RasterizeToPixels3DGSResult rasterize_to_pixels_3dgs(
     bool absgrad
 );
 
+at::Tensor rasterize_to_pixels_importance_3dgs(
+    const at::Tensor &means2d,
+    const at::Tensor &conics,
+    const at::Tensor &colors,
+    const at::Tensor &opacities,
+    const at::optional<at::Tensor> &backgrounds,
+    const at::optional<at::Tensor> &masks,
+    int64_t image_width,
+    int64_t image_height,
+    int64_t tile_size,
+    const at::Tensor &tile_offsets,
+    const at::Tensor &flatten_ids
+);
+
 // Public outputs of rasterize_to_pixels_2dgs (excludes the internal
 // last_ids / median_ids that the forward kernel additionally produces).
 struct RasterizeToPixels2DGSResult
@@ -310,6 +324,21 @@ void launch_rasterize_num_contributing_gaussians_kernel(
     const at::Tensor flatten_ids,  // [n_isects]
     at::Tensor num_contributing,   // [..., image_height, image_width]
     at::Tensor alphas              // [..., image_height, image_width]
+);
+
+void launch_rasterize_to_pixels_importance_3dgs_kernel(
+    const at::Tensor means2d,                   // [..., N, 2]
+    const at::Tensor conics,                    // [..., N, 3]
+    const at::Tensor colors,                    // [..., N, channels]
+    const at::Tensor opacities,                 // [..., N]
+    const at::optional<at::Tensor> backgrounds, // [..., channels]
+    const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets, // [..., tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    at::Tensor importance_scores   // [..., N]
 );
 
 // Sparse counterpart: packed [P] outputs, consuming the sparse layout.

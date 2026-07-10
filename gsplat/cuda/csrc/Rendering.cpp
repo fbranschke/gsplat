@@ -92,6 +92,48 @@ struct TorchArgDef<Rasterization3DGSResult>
     }
 };
 
+#    if GSPLAT_BUILD_3DGS
+struct RasterizationImportance3DGSResult
+{
+    at::Tensor scores;
+    at::Tensor radii;
+    at::Tensor means2d;
+    at::Tensor depths;
+    at::Tensor conics;
+    at::Tensor opacities;
+    at::Tensor colors;
+    at::Tensor tiles_per_gauss;
+    at::Tensor isect_ids;
+    at::Tensor flatten_ids;
+    at::Tensor isect_offsets;
+    int64_t tile_width;
+    int64_t tile_height;
+};
+
+template<>
+struct TorchArgDef<RasterizationImportance3DGSResult>
+{
+    static auto to(const RasterizationImportance3DGSResult &r)
+    {
+        return to_torch_args(
+            r.scores,
+            r.radii,
+            r.means2d,
+            r.depths,
+            r.conics,
+            r.opacities,
+            r.colors,
+            r.tiles_per_gauss,
+            r.isect_ids,
+            r.flatten_ids,
+            r.isect_offsets,
+            r.tile_width,
+            r.tile_height
+        );
+    }
+};
+#    endif
+
 namespace
 {
     void check_rasterization_3dgs_inputs(
@@ -1549,6 +1591,196 @@ Rasterization3DGSResult rasterization_3dgs(
     return result;
 }
 
+#    if GSPLAT_BUILD_3DGS
+RasterizationImportance3DGSResult rasterization_importance_3dgs(
+    const at::Tensor &means,
+    const at::optional<at::Tensor> &covars,
+    const at::optional<at::Tensor> &quats,
+    const at::optional<at::Tensor> &scales,
+    const at::Tensor &opacities,
+    const at::Tensor &colors,
+    const at::Tensor &viewmats,
+    const at::Tensor &Ks,
+    int64_t image_width,
+    int64_t image_height,
+    int64_t tile_size,
+    float eps2d,
+    float near_plane,
+    float far_plane,
+    float radius_clip,
+    const at::optional<at::Tensor> &backgrounds,
+    const at::optional<at::Tensor> &masks,
+    int64_t sh_degree,
+    CameraModelType camera_model,
+    bool segmented
+)
+{
+    DEVICE_GUARD(means);
+
+    check_rasterization_3dgs_inputs(
+        means,
+        covars,
+        quats,
+        scales,
+        opacities,
+        colors,
+        viewmats,
+        Ks,
+        image_width,
+        image_height,
+        tile_size,
+        c10::nullopt,
+        c10::nullopt,
+        c10::nullopt,
+        c10::nullopt,
+        c10::nullopt,
+        c10::nullopt,
+        backgrounds,
+        true,  // has_color
+        false, // append_depth
+        sh_degree,
+        -1,    // extra_signals_sh_degree
+        false, // packed
+        false, // sparse_grad
+        false, // absgrad
+        false, // calc_compensations
+        true,  // rasterize_mode_is_classic
+        3,     // channel_chunk
+        camera_model,
+        c10::nullopt,
+        c10::nullopt,
+        false, // with_eval3d
+        false, // with_ut
+        ShutterType::GLOBAL,
+        true,  // global_z_order
+        false, // use_hit_distance
+        false, // return_normals
+        false  // distributed
+    );
+
+    const int64_t batch_ndim = means.dim() - 2;
+    const int64_t N          = means.size(-2);
+    const int64_t B          = means.numel() / (N * 3);
+    const int64_t C          = viewmats.size(batch_ndim);
+    const int64_t I          = B * C;
+
+    at::optional<at::Tensor> projection_covars = normalize_covars_for_3dgs(covars);
+    ProjectionEWA3DGSFusedResult projection    = projection_ewa_3dgs_fused(
+        means,
+        projection_covars,
+        quats,
+        scales,
+        opacities,
+        viewmats,
+        Ks,
+        image_width,
+        image_height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        false, // calc_compensations
+        camera_model
+    );
+
+    at::Tensor radii   = projection.radii;
+    at::Tensor means2d = projection.means2d;
+    at::Tensor depths  = projection.depths;
+    at::Tensor conics  = projection.conics;
+
+    std::vector<int64_t> opacity_shape = batch_shape_with(means, {C, N});
+    at::Tensor projected_opacities     = opacities.unsqueeze(batch_ndim).expand(opacity_shape);
+    at::Tensor valid_gaussians         = radii.gt(0).all(-1);
+
+    at::Tensor projected_colors;
+    if(sh_degree >= 0)
+    {
+        at::Tensor dirs = compute_classic_viewdirs(
+            means, viewmats, c10::nullopt, c10::nullopt, c10::nullopt, c10::nullopt, c10::nullopt, B, C, N
+        );
+        projected_colors = maybe_evaluate_feature_sh(
+            sh_degree,
+            colors,
+            dirs,
+            valid_gaussians,
+            c10::nullopt,
+            true // clamp_after_bias
+        );
+    }
+    else
+    {
+        projected_colors
+            = normalize_features_layout_3dgs(colors, means, B, C, N, c10::nullopt, c10::nullopt, c10::nullopt);
+    }
+
+    TORCH_CHECK(
+        projected_colors.size(-1) == 3,
+        "rasterization_importance_3dgs currently supports RGB colors only; got ",
+        projected_colors.size(-1),
+        " channels."
+    );
+
+    const int64_t tile_width  = static_cast<int64_t>(std::ceil(image_width / static_cast<double>(tile_size)));
+    const int64_t tile_height = static_cast<int64_t>(std::ceil(image_height / static_cast<double>(tile_size)));
+
+    at::Tensor kernel_means2d   = means2d.contiguous();
+    at::Tensor kernel_radii     = radii.contiguous();
+    at::Tensor kernel_depths    = depths.contiguous();
+    at::Tensor kernel_conics    = conics.contiguous();
+    at::Tensor kernel_opacities = projected_opacities.contiguous();
+    TileIntersectResult isects  = call_torch_op<&intersect_tile>(
+        "gsplat::intersect_tile",
+        kernel_means2d,
+        kernel_radii,
+        kernel_depths,
+        kernel_conics,
+        kernel_opacities,
+        at::optional<at::Tensor>(),
+        at::optional<at::Tensor>(),
+        std::optional<int64_t>(I),
+        tile_size,
+        tile_width,
+        tile_height,
+        true, // sort
+        segmented
+    );
+
+    at::Tensor isect_offsets
+        = call_torch_op<&intersect_offset>("gsplat::intersect_offset", isects.isect_ids, I, tile_width, tile_height);
+    isect_offsets = isect_offsets.reshape(batch_shape_with(means, {C, tile_height, tile_width}));
+
+    at::Tensor scores = rasterize_to_pixels_importance_3dgs(
+        kernel_means2d,
+        kernel_conics,
+        projected_colors.contiguous(),
+        kernel_opacities,
+        contiguous_optional(backgrounds),
+        contiguous_optional(masks),
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        isects.flatten_ids.contiguous()
+    );
+
+    return {
+        .scores          = scores,
+        .radii           = radii,
+        .means2d         = means2d,
+        .depths          = depths,
+        .conics          = conics,
+        .opacities       = projected_opacities,
+        .colors          = projected_colors,
+        .tiles_per_gauss = isects.tiles_per_gauss,
+        .isect_ids       = isects.isect_ids,
+        .flatten_ids     = isects.flatten_ids,
+        .isect_offsets   = isect_offsets,
+        .tile_width      = tile_width,
+        .tile_height     = tile_height,
+    };
+}
+#    endif
+
 #endif // GSPLAT_BUILD_3DGS || GSPLAT_BUILD_3DGUT
 
 #if GSPLAT_BUILD_2DGS
@@ -2047,6 +2279,9 @@ void register_rendering_cuda_impl(torch::Library &m)
 #if GSPLAT_BUILD_3DGS || GSPLAT_BUILD_3DGUT
     m.impl("rasterization_3dgs", to_torch_op<&rasterization_3dgs>);
 #endif
+#if GSPLAT_BUILD_3DGS
+    m.impl("rasterization_importance_3dgs", to_torch_op<&rasterization_importance_3dgs>);
+#endif
 #if GSPLAT_BUILD_2DGS
     m.impl("rasterization_2dgs", to_torch_op<&rasterization_2dgs>);
 #endif
@@ -2056,6 +2291,9 @@ void register_rendering_autograd_cuda_impl(torch::Library &m)
 {
 #if GSPLAT_BUILD_3DGS || GSPLAT_BUILD_3DGUT
     m.impl("rasterization_3dgs", to_torch_op<&rasterization_3dgs>);
+#endif
+#if GSPLAT_BUILD_3DGS
+    m.impl("rasterization_importance_3dgs", to_torch_op<&rasterization_importance_3dgs>);
 #endif
 #if GSPLAT_BUILD_2DGS
     m.impl("rasterization_2dgs", to_torch_op<&rasterization_2dgs>);
@@ -2067,12 +2305,18 @@ void register_rendering_privateuseone_impl(torch::Library &m)
 #if GSPLAT_BUILD_3DGS || GSPLAT_BUILD_3DGUT
     m.impl("rasterization_3dgs", to_torch_op<&rasterization_3dgs>);
 #endif
+#if GSPLAT_BUILD_3DGS
+    m.impl("rasterization_importance_3dgs", to_torch_op<&rasterization_importance_3dgs>);
+#endif
 }
 
 void register_rendering_autograd_privateuseone_impl(torch::Library &m)
 {
 #if GSPLAT_BUILD_3DGS || GSPLAT_BUILD_3DGUT
     m.impl("rasterization_3dgs", to_torch_op<&rasterization_3dgs>);
+#endif
+#if GSPLAT_BUILD_3DGS
+    m.impl("rasterization_importance_3dgs", to_torch_op<&rasterization_importance_3dgs>);
 #endif
 }
 } // namespace gsplat
