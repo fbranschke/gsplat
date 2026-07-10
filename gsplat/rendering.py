@@ -684,6 +684,115 @@ def rasterization(
     return render_colors, render_alphas, meta
 
 
+@trace_function("importance")
+def rasterization_importance(
+    means: Tensor,  # [..., N, 3]
+    quats: Tensor,  # [..., N, 4]
+    scales: Tensor,  # [..., N, 3]
+    opacities: Tensor,  # [..., N]
+    colors: Tensor,  # [..., (C,) N, 3] or [N, K, 3]
+    viewmats: Tensor,  # [..., C, 4, 4]
+    Ks: Tensor,  # [..., C, 3, 3]
+    width: int,
+    height: int,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    radius_clip: float = 0.0,
+    eps2d: float = 0.3,
+    sh_degree: Optional[int] = None,
+    tile_size: Optional[int] = None,
+    backgrounds: Optional[Tensor] = None,
+    masks: Optional[Tensor] = None,
+    rasterize_mode: RasterizeMode = "classic",
+    camera_model: CameraModel = "pinhole",
+    segmented: bool = False,
+    covars: Optional[Tensor] = None,
+) -> Tuple[Tensor, Dict]:
+    """Compute per-Gaussian importance scores.
+
+    Returns:
+        A tuple:
+
+        - **scores**. Per-view Gaussian importance scores. [..., C, N]
+        - **meta**. Projection and intersection intermediates, mirroring the
+          rasterization metadata layout where relevant.
+    """
+    if rasterize_mode != "classic":
+        raise ValueError(
+            "rasterization_importance only supports rasterize_mode='classic'. "
+            f"Got rasterize_mode='{rasterize_mode}'."
+        )
+
+    tile_size = _resolve_tile_size(tile_size, False, width, height)
+
+    if covars is not None:
+        quats, scales = None, None
+        tri_indices = ([0, 0, 0, 1, 1, 2], [0, 1, 2, 1, 2, 2])
+        covars = covars[..., tri_indices[0], tri_indices[1]]
+
+    camera_model_type = _make_lazy_cuda_obj(f"CameraModelType.{camera_model.upper()}")
+    (
+        scores,
+        radii,
+        means2d,
+        depths,
+        conics,
+        projected_opacities,
+        projected_colors,
+        tiles_per_gauss,
+        isect_ids,
+        flatten_ids,
+        isect_offsets,
+        tile_width,
+        tile_height,
+    ) = _make_lazy_cuda_func("rasterization_importance_3dgs")(
+        means.contiguous(),
+        covars.contiguous() if covars is not None else None,
+        quats.contiguous() if quats is not None else None,
+        scales.contiguous() if scales is not None else None,
+        opacities.contiguous(),
+        colors.contiguous(),
+        viewmats.contiguous(),
+        Ks.contiguous(),
+        width,
+        height,
+        tile_size,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        backgrounds.contiguous() if backgrounds is not None else None,
+        masks.contiguous() if masks is not None else None,
+        sh_degree if sh_degree is not None else -1,
+        camera_model_type,
+        segmented,
+    )
+
+    batch_dims = means.shape[:-2]
+    B = math.prod(batch_dims)
+    C = viewmats.shape[-3]
+    meta = {
+        "radii": radii,
+        "means2d": means2d,
+        "depths": depths,
+        "conics": conics,
+        "opacities": projected_opacities,
+        "colors": projected_colors,
+        "tile_width": tile_width,
+        "tile_height": tile_height,
+        "tiles_per_gauss": tiles_per_gauss,
+        "isect_ids": isect_ids,
+        "flatten_ids": flatten_ids,
+        "isect_offsets": isect_offsets,
+        "width": width,
+        "height": height,
+        "tile_size": tile_size,
+        "n_batches": B,
+        "n_cameras": C,
+    }
+    return scores, meta
+
+
 def _maybe_evaluate_sh(
     sh_degree, features, means, radii, viewmats, batch_dims, C, N, clamp
 ):
@@ -762,13 +871,13 @@ def _rasterization(
         Compared to rasterization(), this function does not support some arguments such as
         `packed`, `sparse_grad` and `absgrad`.
     """
+    from gsplat.cuda._math import _quat_scale_to_covar_preci
     from gsplat.cuda._torch_impl import (
         _fully_fused_projection,
         _rasterize_to_pixels,
     )
     from gsplat.cuda._torch_impl_eval3d import _rasterize_to_pixels_eval3d
     from gsplat.cuda._torch_impl_ut import _fully_fused_projection_with_ut
-    from gsplat.cuda._math import _quat_scale_to_covar_preci
 
     if lidar_coeffs is not None:
         width = lidar_coeffs.n_columns

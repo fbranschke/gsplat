@@ -1190,6 +1190,130 @@ std::tuple<at::Tensor, at::Tensor> rasterize_num_contributing_gaussians(
     return std::make_tuple(num_contributing, alphas);
 }
 
+at::Tensor rasterize_to_pixels_importance_3dgs(
+    const at::Tensor &means2d,                   // [..., N, 2]
+    const at::Tensor &conics,                    // [..., N, 3]
+    const at::Tensor &colors,                    // [..., N, channels]
+    const at::Tensor &opacities,                 // [..., N]
+    const at::optional<at::Tensor> &backgrounds, // [..., channels]
+    const at::optional<at::Tensor> &masks,       // [..., tile_height, tile_width]
+    int64_t image_width,
+    int64_t image_height,
+    int64_t tile_size,
+    const at::Tensor &tile_offsets, // [..., tile_height, tile_width]
+    const at::Tensor &flatten_ids   // [n_isects]
+)
+{
+    DEVICE_GUARD(means2d);
+    CHECK_INPUT(means2d);
+    CHECK_INPUT(conics);
+    CHECK_INPUT(colors);
+    CHECK_INPUT(opacities);
+    CHECK_INPUT(tile_offsets);
+    CHECK_INPUT(flatten_ids);
+    if(backgrounds.has_value())
+    {
+        CHECK_INPUT(backgrounds.value());
+    }
+    if(masks.has_value())
+    {
+        CHECK_INPUT(masks.value());
+    }
+
+    TORCH_CHECK_VALUE(
+        tile_size == 4 || tile_size == 16,
+        "Only tile_size in {4, 16} is supported for 3DGS rasterization, got ",
+        tile_size
+    );
+    TORCH_CHECK_VALUE(
+        means2d.dim() >= 2 && means2d.size(-1) == 2,
+        "means2d must have shape [*image_dims, N, 2], got ",
+        means2d.sizes()
+    );
+    TORCH_CHECK_VALUE(means2d.dim() != 2, "packed inputs are not supported for rasterize_to_pixels_importance_3dgs");
+
+    const auto image_dims = means2d.sizes().slice(0, means2d.dim() - 2);
+    const int64_t N       = means2d.size(-2);
+    TORCH_CHECK_VALUE(
+        conics.dim() == means2d.dim()
+            && conics.size(-1) == 3
+            && conics.size(-2) == N
+            && conics.sizes().slice(0, conics.dim() - 2) == image_dims,
+        "conics must have shape [*image_dims, N, 3], got ",
+        conics.sizes()
+    );
+    TORCH_CHECK_VALUE(
+        colors.dim() == means2d.dim()
+            && colors.size(-2) == N
+            && colors.sizes().slice(0, colors.dim() - 2) == image_dims,
+        "colors must have shape [*image_dims, N, channels], got ",
+        colors.sizes()
+    );
+    TORCH_CHECK_VALUE(
+        opacities.dim() == means2d.dim() - 1
+            && opacities.size(-1) == N
+            && opacities.sizes().slice(0, opacities.dim() - 1) == image_dims,
+        "opacities must have shape [*image_dims, N], got ",
+        opacities.sizes()
+    );
+    TORCH_CHECK_VALUE(
+        tile_offsets.dim() == means2d.dim() && tile_offsets.sizes().slice(0, tile_offsets.dim() - 2) == image_dims,
+        "tile_offsets must have shape [*image_dims, tile_height, tile_width], got ",
+        tile_offsets.sizes()
+    );
+    if(backgrounds.has_value())
+    {
+        const auto &bg = backgrounds.value();
+        TORCH_CHECK_VALUE(
+            bg.dim() == means2d.dim() - 1
+                && bg.sizes().slice(0, bg.dim() - 1) == image_dims
+                && bg.size(-1) == colors.size(-1),
+            "backgrounds must have shape [*image_dims, channels], got ",
+            bg.sizes()
+        );
+    }
+    if(masks.has_value())
+    {
+        TORCH_CHECK_VALUE(
+            masks.value().sizes() == tile_offsets.sizes(),
+            "masks must have the same shape as tile_offsets; got masks ",
+            masks.value().sizes(),
+            " and tile_offsets ",
+            tile_offsets.sizes()
+        );
+    }
+
+    const int64_t tile_height = tile_offsets.size(-2);
+    const int64_t tile_width  = tile_offsets.size(-1);
+    TORCH_CHECK_VALUE(
+        tile_height * tile_size >= image_height, "Assert Failed: ", tile_height, " * ", tile_size, " >= ", image_height
+    );
+    TORCH_CHECK_VALUE(
+        tile_width * tile_size >= image_width, "Assert Failed: ", tile_width, " * ", tile_size, " >= ", image_width
+    );
+
+    at::DimVector out_dims(image_dims);
+    out_dims.push_back(N);
+    at::Tensor importance_scores = at::zeros(out_dims, means2d.options());
+
+    launch_rasterize_to_pixels_importance_3dgs_kernel(
+        means2d,
+        conics,
+        colors,
+        opacities,
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        tile_offsets,
+        flatten_ids,
+        importance_scores
+    );
+
+    return importance_scores;
+}
+
 // Sparse counterpart: counts contributing gaussians (and accumulated alpha) for
 // only the requested pixels, packed in original-pixel order ([P]). Consumes the
 // build_sparse_tile_layout / intersect_tile_sparse outputs. Forward-only.
@@ -3598,6 +3722,7 @@ void register_rasterization_cuda_impl(torch::Library &m)
     m.impl("rasterize_to_pixels_sparse", to_torch_op<&rasterize_to_pixels_sparse_fwd>);
     m.impl("rasterize_to_pixels_sparse_bwd", to_torch_op<&rasterize_to_pixels_sparse_bwd>);
     m.impl("rasterize_to_indices_3dgs", to_torch_op<&rasterize_to_indices_3dgs>);
+    m.impl("rasterize_to_pixels_importance_3dgs", &rasterize_to_pixels_importance_3dgs);
     m.impl("rasterize_num_contributing_gaussians", &rasterize_num_contributing_gaussians);
     m.impl("rasterize_num_contributing_gaussians_sparse", &rasterize_num_contributing_gaussians_sparse);
     m.impl("rasterize_contributing_gaussian_ids", &rasterize_contributing_gaussian_ids);

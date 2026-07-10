@@ -1121,6 +1121,24 @@ TORCH_LIBRARY(gsplat, m)
         "active_tiles, Tensor tile_offsets, Tensor flatten_ids, Tensor tile_pixel_mask, Tensor tile_pixel_cumsum, "
         "Tensor pixel_map) -> (Tensor, Tensor)"
     );
+    m.def(
+        "rasterization_importance_3dgs(Tensor means, Tensor? covars, Tensor? "
+        "quats, Tensor? scales, Tensor opacities, "
+        "Tensor colors, Tensor viewmats, Tensor Ks, int image_width, int "
+        "image_height, int tile_size, float eps2d, "
+        "float near_plane, float far_plane, float radius_clip, Tensor? "
+        "backgrounds, Tensor? masks, int sh_degree, int "
+        "camera_model, bool segmented) -> (Tensor, Tensor, Tensor, Tensor, "
+        "Tensor, Tensor, Tensor, Tensor, Tensor, "
+        "Tensor, Tensor, int, int)"
+    );
+    m.def(
+        "rasterize_to_pixels_importance_3dgs(Tensor means2d, Tensor conics, "
+        "Tensor colors, Tensor opacities, Tensor? "
+        "backgrounds, Tensor? masks, int image_width, int image_height, int "
+        "tile_size, Tensor tile_offsets, Tensor "
+        "flatten_ids) -> Tensor"
+    );
 #endif
 
 #if GSPLAT_BUILD_3DGS || GSPLAT_BUILD_3DGUT

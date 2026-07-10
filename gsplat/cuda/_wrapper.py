@@ -1402,6 +1402,67 @@ def rasterize_to_pixels(
     return render_colors, render_alphas
 
 
+@torch.no_grad()
+@trace_function("render2D-importance")
+def rasterize_to_pixels_importance_3dgs(
+    means2d: Tensor,  # [..., N, 2]
+    conics: Tensor,  # [..., N, 3]
+    colors: Tensor,  # [..., N, channels]
+    opacities: Tensor,  # [..., N]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    tile_offsets: Tensor,  # [..., tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    backgrounds: Optional[Tensor] = None,  # [..., channels]
+    masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
+) -> Tensor:
+    """Computes a per-Gaussian importance score for dense 3DGS rasterization.
+
+    The score estimates the image-space impact of removing each Gaussian by
+    replaying the same front-to-back compositing order used by
+    :func:`rasterize_to_pixels` and accumulating a color-change proxy per pixel.
+
+    Args:
+        means2d: Projected Gaussian means. [*image_dims, N, 2].
+        conics: Inverse projected covariances. [*image_dims, N, 3].
+        colors: Gaussian colors or features. [*image_dims, N, channels].
+        opacities: Gaussian opacities. [*image_dims, N].
+        image_width: Image width.
+        image_height: Image height.
+        tile_size: Tile size.
+        tile_offsets: Intersection offsets from :func:`isect_offset_encode`. [*image_dims, tile_height, tile_width].
+        flatten_ids: Flattened Gaussian indices from :func:`isect_tiles`. [n_isects].
+        backgrounds: Optional background colors. [*image_dims, channels]. Default: None.
+        masks: Optional tile mask. [*image_dims, tile_height, tile_width]. Default: None.
+
+    Returns:
+        Per-image Gaussian importance scores with shape [*image_dims, N].
+
+    Note:
+        Packed inputs are not supported; use dense per-image tensors so the
+        output score axis matches the original Gaussian index dimension.
+    """
+    if backgrounds is not None:
+        backgrounds = backgrounds.contiguous()
+    if masks is not None:
+        masks = masks.contiguous()
+
+    return _make_lazy_cuda_func("rasterize_to_pixels_importance_3dgs")(
+        means2d.contiguous(),
+        conics.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        tile_offsets.contiguous(),
+        flatten_ids.contiguous(),
+    )
+
+
 @trace_function("render2D-sparse-fwd")
 def rasterize_to_pixels_sparse(
     means2d: Tensor,  # [..., N, 2] or [nnz, 2]
